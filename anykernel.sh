@@ -4,7 +4,7 @@
 ### AnyKernel setup
 # begin properties
 properties() { '
-kernel.string=Chandelier Kernel By Pavelc
+kernel.string=Templar Kernel for android12-5.10 devices by WiL (@Steambot12)
 do.devicecheck=1
 do.modules=0
 do.systemless=0
