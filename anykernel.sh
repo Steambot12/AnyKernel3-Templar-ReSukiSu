@@ -2,41 +2,53 @@
 ## osm0sis @ xda-developers
 
 ### AnyKernel setup
-# begin properties
+# Global properties
 properties() { '
 kernel.string=Templar Kernel for android12-5.10 devices by WiL (@Steambot12)
-do.devicecheck=1
+do.devicecheck=0
 do.modules=0
-do.systemless=0
+do.systemless=1
 do.cleanup=1
-do.cleanuponabort=1
-device.name1=marble
-device.name2=marblein
+do.cleanuponabort=0
+device.name1=
+device.name2=
 supported.versions=
 supported.patchlevels=
 supported.vendorpatchlevels=
 '; } # end properties
 
 ### AnyKernel install
-## boot files attributes
-boot_attributes() {
-set_perm_recursive 0 0 755 644 $RAMDISK/*;
-set_perm_recursive 0 0 750 750 $RAMDISK/init* $RAMDISK/sbin;
-} # end attributes
 
-## boot shell variables
-BLOCK="/dev/block/by-name/boot"
-IS_SLOT_DEVICE=auto
-RAMDISK_COMPRESSION=auto
-PATCH_VBMETA_FLAG=auto
+## Boot shell variables
+block=boot
+is_slot_device=auto
+ramdisk_compression=auto
+patch_vbmeta_flag=auto
 
-# import functions/variables and setup patching - see for reference (DO NOT REMOVE)
+# Import functions/variables and setup patching - see for reference (DO NOT REMOVE)
 . tools/ak3-core.sh
 
-# boot install
-dump_boot
-write_boot
+ui_print " "
+ui_print "- Checking kernel version..."
 
-## end boot install
+current_kernel=$(uname -r | sed -E 's/^([0-9]+\.[0-9]+).*/\1/') 
+new_kernel=$(strings "${AKHOME}"/Image 2>/dev/null | grep -E -m1 'Linux version.*#' | awk '{print $3}')
 
-## install additional module
+if [[ $current_kernel == "5.10" ]]; then
+    ui_print "- Compatible: $current_kernel"
+else
+    ui_print "- Incompatible: $current_kernel"
+    exit 1
+fi
+
+ui_print " "
+
+## Start boot install
+
+split_boot # Use split_boot to skip ramdisk unpack, e.g., for devices with init_boot ramdisk
+
+ui_print "- $(strings "${home}"/Image 2>/dev/null | grep -E -m1 'Linux version.*#' | awk '{print $3}')"
+
+flash_boot # Use flash_boot to skip ramdisk repack, e.g., for devices with init_boot ramdisk
+
+## End boot install
