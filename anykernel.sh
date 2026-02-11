@@ -84,7 +84,7 @@ deep_kernel_cleanup() {
     ui_print "  ✓ Cleanup complete"
 }
 
-## Auto-detect boot partition and backup (AFTER split_boot)
+## Auto-detect boot partition (MediaTek & Qualcomm compatible)
 backup_boot_image() {
     backup_dir="/sdcard/TemplarKernel_Backup"
     timestamp=$(date +%Y%m%d_%H%M%S)
@@ -96,49 +96,106 @@ backup_boot_image() {
     
     ui_print "- Creating boot backup..."
     
-    # Method 1: Use $bootimg from ak3-core.sh (set by split_boot)
     boot_partition=""
+    detection_method=""
+    
+    # Method 1: Use $bootimg from ak3-core.sh (set by split_boot)
     if [ -n "$bootimg" ] && [ -b "$bootimg" ]; then
         boot_partition="$bootimg"
-        ui_print "  • Found boot: $bootimg (ak3)"
+        detection_method="ak3-core"
     fi
     
-    # Method 2: Fallback detection if $bootimg not available
+    # Method 2: Check current slot (A/B devices)
     if [ -z "$boot_partition" ]; then
-        # Try common paths
+        current_slot=$(getprop ro.boot.slot_suffix 2>/dev/null)
+        if [ -n "$current_slot" ]; then
+            # Try boot with slot suffix (boot_a or boot_b)
+            for base in "/dev/block/bootdevice/by-name" "/dev/block/by-name" "/dev/block/platform/*/by-name" "/dev/block/platform/*/*/by-name"; do
+                for path in ${base}/boot${current_slot} ${base}/boot; do
+                    if [ -b "$path" ] 2>/dev/null; then
+                        boot_partition="$path"
+                        detection_method="slot-aware ($current_slot)"
+                        break 2
+                    fi
+                done
+            done
+        fi
+    fi
+    
+    # Method 3: MediaTek specific paths
+    if [ -z "$boot_partition" ]; then
+        # Check MediaTek common paths
         for path in \
-            "/dev/block/bootdevice/by-name/boot" \
-            "/dev/block/by-name/boot" \
-            "/dev/block/platform/*/by-name/boot" \
-            "/dev/block/platform/*/*/by-name/boot" \
-            $(find /dev/block -name boot 2>/dev/null | head -1); do
+            "/dev/block/platform/bootdevice/by-name/boot" \
+            "/dev/block/platform/soc/*/by-name/boot" \
+            "/dev/block/platform/soc/*/*/by-name/boot" \
+            "/dev/block/by-name/boot_para" \
+            "/dev/block/mmcblk0boot0" \
+            "/dev/block/mmcblk0boot1"; do
             
-            # Expand wildcard and check
+            # Expand wildcards
             for expanded in $path; do
-                if [ -b "$expanded" ]; then
+                if [ -b "$expanded" ] 2>/dev/null; then
                     boot_partition="$expanded"
-                    ui_print "  • Found boot: $expanded (auto)"
+                    detection_method="mediatek-path"
                     break 2
                 fi
             done
         done
     fi
     
+    # Method 4: Aggressive search via find (last resort)
+    if [ -z "$boot_partition" ]; then
+        # Search for any partition named "boot*"
+        boot_partition=$(find /dev/block -type b -name "boot*" 2>/dev/null | grep -E "boot$|boot_[ab]$|boot_para$|mmcblk.*boot" | head -1)
+        if [ -n "$boot_partition" ] && [ -b "$boot_partition" ]; then
+            detection_method="aggressive-search"
+        else
+            boot_partition=""
+        fi
+    fi
+    
+    # Method 5: Parse /proc/mounts or /proc/partitions
+    if [ -z "$boot_partition" ]; then
+        # Check if boot is mounted (shouldn't be, but check anyway)
+        boot_partition=$(grep -m1 " boot " /proc/mounts 2>/dev/null | awk '{print $1}')
+        if [ -n "$boot_partition" ] && [ -b "$boot_partition" ]; then
+            detection_method="proc-mounts"
+        else
+            # Try /proc/partitions
+            boot_line=$(grep -iE "boot|mmcblk.*boot" /proc/partitions 2>/dev/null | tail -1 | awk '{print $4}')
+            if [ -n "$boot_line" ]; then
+                boot_partition="/dev/block/$boot_line"
+                if [ -b "$boot_partition" ]; then
+                    detection_method="proc-partitions"
+                else
+                    boot_partition=""
+                fi
+            fi
+        fi
+    fi
+    
     # Perform backup if boot partition found
     if [ -n "$boot_partition" ] && [ -b "$boot_partition" ]; then
+        ui_print "  • Boot found: $boot_partition"
+        ui_print "    Method: $detection_method"
+        
         backup_file="$backup_dir/OLD_boot_${timestamp}.img"
         
-        # Execute dd with error handling
+        # Execute dd with progress (suppress records output)
         dd if="$boot_partition" of="$backup_file" bs=4096 2>&1 | grep -v "records"
         
         # Verify backup
         if [ -f "$backup_file" ]; then
-            backup_size=$(stat -c%s "$backup_file" 2>/dev/null || echo 0)
+            backup_size=$(stat -c%s "$backup_file" 2>/dev/null || stat -f%z "$backup_file" 2>/dev/null || echo 0)
             backup_mb=$((backup_size / 1048576))
             
             if [ "$backup_size" -gt 1048576 ]; then
                 ui_print "  ✓ Backup saved: ${backup_mb}MB"
-                ui_print "    File: OLD_boot_${timestamp}.img"
+                
+                # Save boot partition path for recovery instructions
+                echo "Boot partition: $boot_partition" >> "$backup_dir/OLD_kernel_${timestamp}.info"
+                echo "Detection method: $detection_method" >> "$backup_dir/OLD_kernel_${timestamp}.info"
             else
                 ui_print "  ✗ Backup too small (${backup_mb}MB), removing"
                 rm -f "$backup_file"
@@ -148,11 +205,24 @@ backup_boot_image() {
         fi
     else
         ui_print "  ! Boot partition not detected"
+        ui_print "    Device: $(getprop ro.product.board 2>/dev/null || echo 'Unknown')"
+        ui_print "    Searching common MediaTek paths failed"
         ui_print "    Kernel info saved, boot backup skipped"
+        
+        # Debug info
+        ui_print " "
+        ui_print "  Debug Info (for developer):"
+        ui_print "    • Current slot: $(getprop ro.boot.slot_suffix 2>/dev/null || echo 'none')"
+        ui_print "    • Board: $(getprop ro.product.board 2>/dev/null)"
+        ui_print "    • Available boot* partitions:"
+        find /dev/block -name "boot*" 2>/dev/null | head -5 | while read p; do
+            ui_print "      $p"
+        done
     fi
     
     ui_print " "
 }
+
 
 ## Simplified version check
 check_kernel_version() {
