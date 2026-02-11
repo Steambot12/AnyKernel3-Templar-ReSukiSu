@@ -5,7 +5,7 @@
 ### AnyKernel setup
 # Global properties
 properties() { '
-kernel.string=Templar Kernel v4.8-ReSuki for android12-5.10 devices by WiL (@Steambot12)
+kernel.string=Templar Kernel by WiL (@Steambot12)
 do.devicecheck=0
 do.modules=0
 do.systemless=1
@@ -29,328 +29,250 @@ patch_vbmeta_flag=auto
 # Import functions/variables and setup patching - see for reference (DO NOT REMOVE)
 . tools/ak3-core.sh
 
-## Deep kernel cleanup function - removes ALL traces of old kernel config
+## Simplified deep cleanup (silent mode with progress)
 deep_kernel_cleanup() {
-    ui_print " "
-    ui_print "================================================"
-    ui_print " DEEP KERNEL CLEANUP - Removing Old Config"
-    ui_print "================================================"
+    ui_print "- Deep cleaning old kernel configs..."
     
-    # 1. Clean kernel module dependencies and cache
-    ui_print "  [1/10] Clearing module dependency database..."
-    if [ -d /data/vendor/modules ]; then
-        rm -rf /data/vendor/modules/modules.* 2>/dev/null
-        rm -f /data/vendor/modules/*.bin 2>/dev/null
-    fi
-    
-    # 2. Clean sysctl persistent configs
-    ui_print "  [2/10] Removing persistent sysctl configs..."
-    if [ -d /data/vendor/sysctl ]; then
-        rm -rf /data/vendor/sysctl/* 2>/dev/null
-    fi
-    rm -f /data/local/kernel.sysctl 2>/dev/null
-    rm -f /data/vendor/etc/sysctl.d/*.conf 2>/dev/null
-    
-    # 3. Clean scheduler persistent state
-    ui_print "  [3/10] Clearing CPU scheduler state..."
-    if [ -d /data/vendor/scheduler ]; then
-        rm -rf /data/vendor/scheduler/* 2>/dev/null
-    fi
-    # Reset schedtune boosting values if persisted
-    if [ -d /dev/stune ]; then
-        for stune_dir in /dev/stune/*/; do
-            echo 0 > "${stune_dir}schedtune.boost" 2>/dev/null
-            echo 0 > "${stune_dir}schedtune.prefer_idle" 2>/dev/null
+    # Clean all in one pass (silent)
+    {
+        # Module deps & cache
+        [ -d /data/vendor/modules ] && rm -rf /data/vendor/modules/modules.* /data/vendor/modules/*.bin
+        
+        # Sysctl & scheduler configs
+        [ -d /data/vendor/sysctl ] && rm -rf /data/vendor/sysctl/*
+        [ -d /data/vendor/scheduler ] && rm -rf /data/vendor/scheduler/*
+        rm -f /data/local/kernel.sysctl /data/vendor/etc/sysctl.d/*.conf
+        
+        # Reset schedtune if exists
+        [ -d /dev/stune ] && for d in /dev/stune/*/; do
+            echo 0 > "${d}schedtune.boost" 2>/dev/null
+            echo 0 > "${d}schedtune.prefer_idle" 2>/dev/null
         done
-    fi
-    
-    # 4. Clean I/O scheduler configs and queue state
-    ui_print "  [4/10] Resetting I/O scheduler configs..."
-    if [ -d /data/vendor/iosched ]; then
-        rm -rf /data/vendor/iosched/* 2>/dev/null
-    fi
-    # Reset I/O scheduler to default before flash
-    for queue in /sys/block/*/queue/scheduler; do
-        if [ -f "$queue" ]; then
-            echo "none" > "$queue" 2>/dev/null
+        
+        # I/O scheduler reset
+        [ -d /data/vendor/iosched ] && rm -rf /data/vendor/iosched/*
+        for q in /sys/block/*/queue/scheduler; do
+            [ -f "$q" ] && echo "none" > "$q" 2>/dev/null
+        done
+        
+        # CPUFreq & thermal
+        [ -d /data/vendor/cpufreq ] && rm -rf /data/vendor/cpufreq/*
+        [ -d /data/system/cpufreq ] && rm -rf /data/system/cpufreq/*
+        [ -d /data/vendor/thermal ] && rm -rf /data/vendor/thermal/*
+        [ -d /data/vendor/thermal_config ] && rm -f /data/vendor/thermal_config/*.conf
+        
+        # Kernel cache & logs
+        [ -d /data/vendor/kernel ] && rm -rf /data/vendor/kernel/*
+        [ -d /data/kernel ] && rm -rf /data/kernel/*
+        dmesg -c > /dev/null 2>&1
+        
+        # BPF/eBPF cleanup
+        if [ -d /sys/fs/bpf ]; then
+            umount /sys/fs/bpf 2>/dev/null
+            mount -t bpf bpf /sys/fs/bpf 2>/dev/null
         fi
-    done
+        [ -d /data/vendor/bpf ] && rm -f /data/vendor/bpf/*.o /data/vendor/bpf/*.prog
+        
+        # Network & temp files
+        [ -d /data/vendor/netd ] && rm -f /data/vendor/netd/.*.configured
+        rm -rf /data/local/tmp/kernel* /data/local/tmp/*.ko /data/local/tmp/kern_*.log
+        rm -f /cache/kernel* /data/cache/kernel /data/bootconfig
+        
+        sync
+    } 2>/dev/null
     
-    # 5. Clean CPU frequency governor persistent state
-    ui_print "  [5/10] Clearing CPU frequency state..."
-    if [ -d /data/vendor/cpufreq ]; then
-        rm -rf /data/vendor/cpufreq/* 2>/dev/null
-    fi
-    if [ -d /data/system/cpufreq ]; then
-        rm -rf /data/system/cpufreq/* 2>/dev/null
-    fi
-    
-    # 6. Clean thermal configs and zone state
-    ui_print "  [6/10] Resetting thermal management..."
-    if [ -d /data/vendor/thermal ]; then
-        rm -rf /data/vendor/thermal/* 2>/dev/null
-    fi
-    # Clear thermal zone trip points cache
-    if [ -d /data/vendor/thermal_config ]; then
-        rm -f /data/vendor/thermal_config/*.conf 2>/dev/null
-    fi
-    
-    # 7. Clean kernel runtime cache and logs
-    ui_print "  [7/10] Clearing kernel runtime data..."
-    if [ -d /data/vendor/kernel ]; then
-        rm -rf /data/vendor/kernel/* 2>/dev/null
-    fi
-    if [ -d /data/kernel ]; then
-        rm -rf /data/kernel/* 2>/dev/null
-    fi
-    # Clean kernel ring buffer logs that might contain old params
-    dmesg -c > /dev/null 2>&1
-    
-    # 8. Clean BPF/eBPF programs and maps from old kernel
-    ui_print "  [8/10] Removing BPF programs..."
-    if [ -d /sys/fs/bpf ]; then
-        # Unmount and remount to clear pinned programs
-        umount /sys/fs/bpf 2>/dev/null
-        mount -t bpf bpf /sys/fs/bpf 2>/dev/null
-    fi
-    if [ -d /data/vendor/bpf ]; then
-        rm -f /data/vendor/bpf/*.o 2>/dev/null
-        rm -f /data/vendor/bpf/*.prog 2>/dev/null
-    fi
-    
-    # 9. Clean network stack parameters
-    ui_print "  [9/10] Resetting network parameters..."
-    if [ -d /proc/sys/net ]; then
-        # Reset TCP/IP stack to defaults (will be reinitialized by new kernel)
-        if [ -d /data/vendor/netd ]; then
-            rm -f /data/vendor/netd/.*.configured 2>/dev/null
-        fi
-    fi
-    
-    # 10. Clean temporary kernel build artifacts and old configs
-    ui_print "  [10/10] Cleaning temporary files..."
-    rm -rf /data/local/tmp/kernel* 2>/dev/null
-    rm -f /data/local/tmp/*.ko 2>/dev/null
-    rm -f /data/local/tmp/kern_*.log 2>/dev/null
-    rm -f /cache/kernel* 2>/dev/null
-    rm -rf /data/cache/kernel 2>/dev/null
-    
-    # Additional: Clear bootconfig if exists (for GKI 2.0)
-    if [ -f /data/bootconfig ]; then
-        ui_print "  [EXTRA] Clearing bootconfig cache..."
-        rm -f /data/bootconfig 2>/dev/null
-    fi
-    
-    # Force filesystem sync to ensure all changes are written
-    ui_print "  • Syncing filesystem changes..."
-    sync
-    sleep 1
-    
-    ui_print "- Deep cleanup complete!"
-    ui_print "  ✓ All old kernel configs removed"
-    ui_print " "
+    ui_print "  ✓ Cleanup complete"
 }
 
-## Backup current kernel config (optional safety)
-backup_kernel_config() {
-    ui_print " "
-    ui_print "- Creating backup of current kernel..."
-    
+## Auto-detect boot partition and backup (AFTER split_boot)
+backup_boot_image() {
     backup_dir="/sdcard/TemplarKernel_Backup"
     timestamp=$(date +%Y%m%d_%H%M%S)
     
     mkdir -p "$backup_dir" 2>/dev/null
     
-    # Backup current kernel version info
-    uname -a > "$backup_dir/kernel_${timestamp}.info" 2>/dev/null
+    # Save current kernel info
+    uname -a > "$backup_dir/OLD_kernel_${timestamp}.info" 2>/dev/null
     
-    # Backup current boot image (if possible)
-    if [ -b "$block" ]; then
-        ui_print "  • Backing up current boot image..."
-        dd if="$block" of="$backup_dir/boot_${timestamp}.img" bs=4096 2>/dev/null
-        if [ -f "$backup_dir/boot_${timestamp}.img" ]; then
-            ui_print "  ✓ Backup saved to: $backup_dir"
+    ui_print "- Creating boot backup..."
+    
+    # Method 1: Use $bootimg from ak3-core.sh (set by split_boot)
+    boot_partition=""
+    if [ -n "$bootimg" ] && [ -b "$bootimg" ]; then
+        boot_partition="$bootimg"
+        ui_print "  • Found boot: $bootimg (ak3)"
+    fi
+    
+    # Method 2: Fallback detection if $bootimg not available
+    if [ -z "$boot_partition" ]; then
+        # Try common paths
+        for path in \
+            "/dev/block/bootdevice/by-name/boot" \
+            "/dev/block/by-name/boot" \
+            "/dev/block/platform/*/by-name/boot" \
+            "/dev/block/platform/*/*/by-name/boot" \
+            $(find /dev/block -name boot 2>/dev/null | head -1); do
+            
+            # Expand wildcard and check
+            for expanded in $path; do
+                if [ -b "$expanded" ]; then
+                    boot_partition="$expanded"
+                    ui_print "  • Found boot: $expanded (auto)"
+                    break 2
+                fi
+            done
+        done
+    fi
+    
+    # Perform backup if boot partition found
+    if [ -n "$boot_partition" ] && [ -b "$boot_partition" ]; then
+        backup_file="$backup_dir/OLD_boot_${timestamp}.img"
+        
+        # Execute dd with error handling
+        dd if="$boot_partition" of="$backup_file" bs=4096 2>&1 | grep -v "records"
+        
+        # Verify backup
+        if [ -f "$backup_file" ]; then
+            backup_size=$(stat -c%s "$backup_file" 2>/dev/null || echo 0)
+            backup_mb=$((backup_size / 1048576))
+            
+            if [ "$backup_size" -gt 1048576 ]; then
+                ui_print "  ✓ Backup saved: ${backup_mb}MB"
+                ui_print "    File: OLD_boot_${timestamp}.img"
+            else
+                ui_print "  ✗ Backup too small (${backup_mb}MB), removing"
+                rm -f "$backup_file"
+            fi
+        else
+            ui_print "  ✗ Backup failed (file not created)"
         fi
+    else
+        ui_print "  ! Boot partition not detected"
+        ui_print "    Kernel info saved, boot backup skipped"
     fi
     
     ui_print " "
 }
 
-## Kernel version check with enhanced validation (FIXED)
+## Simplified version check
 check_kernel_version() {
-    ui_print " "
-    ui_print "- Checking kernel compatibility..."
-    
-    # Get current running kernel version - multiple methods for reliability
     current_kernel=$(uname -r 2>/dev/null | cut -d'.' -f1-2)
-    current_full=$(uname -r 2>/dev/null)
+    [ -z "$current_kernel" ] && current_kernel=$(cat /proc/version 2>/dev/null | awk '{print $3}' | cut -d'.' -f1-2)
     
-    # If uname fails, try alternative method
-    if [ -z "$current_kernel" ]; then
-        current_kernel=$(cat /proc/version 2>/dev/null | awk '{print $3}' | cut -d'.' -f1-2)
-        current_full=$(cat /proc/version 2>/dev/null | awk '{print $3}')
-    fi
-    
-    # Extract new kernel version from Image - use multiple methods
-    # Method 1: Try standard Linux version string
     new_kernel_string=$(strings "$home"/Image 2>/dev/null | grep -m1 'Linux version' | awk '{print $3}' | cut -d'.' -f1-2)
+    [ -z "$new_kernel_string" ] && new_kernel_string=$(strings "$home"/Image 2>/dev/null | grep -m1 '5\.10\.' | cut -d'.' -f1-2)
+    [ -z "$new_kernel_string" ] && new_kernel_string="5.10"
     
-    # Method 2: If method 1 fails, try alternative pattern
-    if [ -z "$new_kernel_string" ]; then
-        new_kernel_string=$(strings "$home"/Image 2>/dev/null | grep -m1 '5\.10\.' | head -1 | cut -d'.' -f1-2)
-    fi
-    
-    # Method 3: If still empty, try parsing full version
-    if [ -z "$new_kernel_string" ]; then
-        new_kernel_full=$(strings "$home"/Image 2>/dev/null | grep -E -m1 'Linux version [0-9]' | awk '{print $3}')
-        new_kernel_string=$(echo "$new_kernel_full" | cut -d'.' -f1-2)
-    fi
-    
-    # Get full version for display
-    new_kernel_full=$(strings "$home"/Image 2>/dev/null | grep -m1 'Linux version' | awk '{print $3}')
-    
-    # Fallback: If extraction still fails, assume 5.10 (for safety)
-    if [ -z "$new_kernel_string" ]; then
-        ui_print "  ! Warning: Could not extract kernel version from Image"
-        ui_print "  ! Assuming target is 5.10 based on file content"
-        new_kernel_string="5.10"
-        new_kernel_full="5.10.x (undetected)"
-    fi
-    
-    ui_print "  • Current: $current_full"
-    ui_print "  • New:     $new_kernel_full"
-    ui_print " "
-    
-    # More lenient version check - only check major.minor
     current_major=$(echo "$current_kernel" | cut -d'.' -f1)
     current_minor=$(echo "$current_kernel" | cut -d'.' -f2)
     new_major=$(echo "$new_kernel_string" | cut -d'.' -f1)
     new_minor=$(echo "$new_kernel_string" | cut -d'.' -f2)
     
-    ui_print "  • Version comparison:"
-    ui_print "    Current: $current_major.$current_minor"
-    ui_print "    Target:  $new_major.$new_minor"
-    ui_print " "
+    ui_print "- Version: $current_kernel → $new_kernel_string"
     
-    # Check compatibility (5.10.x = compatible)
     if [ "$current_major" = "5" ] && [ "$current_minor" = "10" ] && [ "$new_major" = "5" ] && [ "$new_minor" = "10" ]; then
-        ui_print "  ✓ Version check: COMPATIBLE (GKI 5.10)"
-        
-        # Optional: Check for specific features
-        if strings "$home"/Image 2>/dev/null | grep -q "SCHED_BORE"; then
-            ui_print "  ✓ SchedBORE detected in new kernel"
-        fi
-        
-        if strings "$home"/Image 2>/dev/null | grep -iq "ssg"; then
-            ui_print "  ✓ SSG I/O scheduler detected"
-        fi
-        
+        strings "$home"/Image 2>/dev/null | grep -q "SCHED_BORE" && ui_print "  ✓ SchedBORE enabled"
+        strings "$home"/Image 2>/dev/null | grep -iq "ssg" && ui_print "  ✓ SSG I/O scheduler enabled"
         return 0
-        
     elif [ "$new_major" = "5" ] && [ "$new_minor" = "10" ]; then
-        # New kernel is 5.10 but current is not - warn but allow
-        ui_print " "
-        ui_print "! WARNING: Kernel base mismatch !"
-        ui_print "! Current: $current_major.$current_minor | Target: $new_major.$new_minor !"
-        ui_print "! Proceeding anyway - monitor for issues"
-        ui_print " "
-        sleep 2
+        ui_print "  ! Warning: Base mismatch, proceeding anyway"
+        sleep 1
         return 0
-        
     else
-        # Completely incompatible
         ui_print " "
-        ui_print "✗✗✗ CRITICAL: INCOMPATIBLE KERNEL ✗✗✗"
-        ui_print "! This kernel is for GKI 5.10 ONLY !"
-        ui_print "! Current: $current_major.$current_minor"
-        ui_print "! Target:  $new_major.$new_minor"
-        ui_print " "
-        ui_print "Installation aborted for safety."
-        ui_print "Please use correct kernel version for your device."
-        ui_print " "
+        ui_print "✗ INCOMPATIBLE: Requires GKI 5.10 kernel base"
+        ui_print "  Current: $current_major.$current_minor | Target: $new_major.$new_minor"
         exit 1
     fi
 }
 
-## Post-installation validation
+## Minimal post-install validation
 post_install_check() {
-    ui_print " "
-    ui_print "- Running post-installation checks..."
-    
-    # Verify boot image was written correctly
-    if [ -b "$block" ]; then
-        boot_size=$(stat -c%s "$block" 2>/dev/null)
+    # Verify boot partition after flash
+    if [ -n "$bootimg" ] && [ -b "$bootimg" ]; then
+        boot_size=$(stat -c%s "$bootimg" 2>/dev/null || echo 0)
         if [ "$boot_size" -gt 0 ]; then
-            ui_print "  ✓ Boot partition written successfully"
+            ui_print "  ✓ Boot partition verified"
         else
-            ui_print "  ✗ WARNING: Boot partition may be corrupted!"
+            ui_print "  ! Warning: Boot partition check failed"
         fi
     fi
     
-    # Check if new kernel Image is valid
+    # Verify new kernel Image integrity
     if [ -f "$home/Image" ]; then
-        kernel_size=$(stat -c%s "$home/Image")
-        if [ "$kernel_size" -gt 10485760 ]; then  # > 10MB
-            ui_print "  ✓ Kernel Image size valid ($kernel_size bytes)"
+        kernel_size=$(stat -c%s "$home/Image" 2>/dev/null || echo 0)
+        kernel_mb=$((kernel_size / 1048576))
+        
+        if [ "$kernel_size" -gt 10485760 ]; then
+            ui_print "  ✓ Kernel Image: ${kernel_mb}MB"
         else
-            ui_print "  ✗ WARNING: Kernel Image seems too small!"
+            ui_print "  ! Warning: Kernel Image too small"
         fi
     fi
-    
-    ui_print "  ✓ All checks passed"
-    ui_print " "
 }
 
-## Set optimal post-flash configs (will be applied on next boot)
+## Silent post-boot script setup
 set_postflash_configs() {
-    ui_print " "
-    ui_print "- Preparing post-boot configuration..."
-    
-    # Create post-boot script directory if not exists
     mkdir -p /data/adb/service.d 2>/dev/null
     
-    # Create post-boot optimization script
     cat > /data/adb/service.d/templar_kernel_init.sh << 'EOF'
 #!/system/bin/sh
-# Templar Kernel Post-Boot Initialization
-# This runs once after flash to ensure clean config
-
 LOGFILE="/data/local/tmp/templar_init.log"
-
 {
-    echo "Templar Kernel Init - $(date)"
+    echo "==================================="
+    echo "Templar Kernel Post-Boot Init"
+    echo "Timestamp: $(date)"
+    echo "==================================="
+    echo ""
     
-    # Wait for boot completion
+    # Wait for system boot completion
     sleep 30
     
-    # Verify SchedBORE is active
+    echo "Checking kernel features..."
+    
+    # Verify SchedBORE
     if [ -f /proc/sys/kernel/sched_bore ]; then
-        echo "✓ SchedBORE active"
+        echo "✓ SchedBORE: Active"
+        echo "  Value: $(cat /proc/sys/kernel/sched_bore 2>/dev/null)"
+    else
+        echo "✗ SchedBORE: Not found"
     fi
     
-    # Verify SSG I/O scheduler
+    echo ""
+    echo "Checking I/O schedulers..."
+    
+    # Verify I/O schedulers
     for queue in /sys/block/*/queue/scheduler; do
-        current=$(cat "$queue" 2>/dev/null | grep -o '\[.*\]' | tr -d '[]')
-        echo "I/O Scheduler on $(dirname $queue | xargs basename): $current"
+        if [ -f "$queue" ]; then
+            device=$(dirname $(dirname $queue) | xargs basename)
+            current=$(cat "$queue" 2>/dev/null | grep -o '\[.*\]' | tr -d '[]')
+            echo "  $device: $current"
+        fi
     done
+    
+    echo ""
+    echo "Clearing lingering cache..."
     
     # Clear any lingering kernel cache
     sync
     echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
     
-    echo "✓ Initialization complete"
+    echo ""
+    echo "✓ Post-boot initialization complete"
+    echo "==================================="
     
     # Self-destruct (run only once after flash)
     rm -f /data/adb/service.d/templar_kernel_init.sh
     
 } > "$LOGFILE" 2>&1
+
+# Create notification (if supported)
+if [ -f /system/bin/cmd ]; then
+    /system/bin/cmd notification post -S bigtext -t "Templar Kernel" "Tag" "Kernel initialized successfully. Check log: $LOGFILE" 2>/dev/null
+fi
 EOF
     
     chmod 755 /data/adb/service.d/templar_kernel_init.sh 2>/dev/null
-    
-    ui_print "  ✓ Post-boot script configured"
-    ui_print "  • Will run automatically on next boot"
-    ui_print " "
 }
 
 ## ==============================================
@@ -359,74 +281,57 @@ EOF
 
 ui_print " "
 ui_print "================================================"
-ui_print "  TEMPLAR KERNEL INSTALLER v4.8-ReSuki"
-ui_print "  by WiL (@Steambot12)"
+ui_print " Templar Kernel Installer"
 ui_print "================================================"
-ui_print " "
-ui_print "  • GKI 5.10 with SchedBORE & SSG I/O"
-ui_print "  • Deep cleanup enabled for fresh install"
-ui_print " "
 
-# Step 1: Backup current setup (optional but recommended)
-backup_kernel_config
-
-# Step 2: Check kernel compatibility
+# Step 1: Version check (before any modifications)
 check_kernel_version
 
-# Step 3: Deep cleanup - Remove ALL old kernel traces
+# Step 2: Deep cleanup (before flashing)
 deep_kernel_cleanup
 
-# Step 4: Start kernel installation
-ui_print "================================================"
-ui_print " INSTALLING NEW KERNEL"
-ui_print "================================================"
 ui_print " "
+ui_print "- Preparing boot partition..."
 
 ## Begin boot install
-split_boot  # Skip ramdisk unpack for GKI devices with init_boot ramdisk
+split_boot  # This detects and extracts boot partition
 
-# Display detailed kernel info
-kernel_version=$(strings "$home"/Image 2>/dev/null | grep -E -m1 'Linux version.*#' | awk '{print $3}')
-kernel_builder=$(strings "$home"/Image 2>/dev/null | grep -E -m1 'Linux version.*@' | sed -E 's/.*@([^ ]+).*/\1/')
-kernel_date=$(strings "$home"/Image 2>/dev/null | grep -E -m1 'Linux version.*#' | sed -E 's/.*#[0-9]+ ([A-Z][a-z]+ .+)/\1/')
+# Step 3: Backup OLD boot (AFTER split_boot when $bootimg is available)
+backup_boot_image
 
-ui_print "  • Kernel Version: $kernel_version"
-ui_print "  • Built by:       $kernel_builder"
-ui_print "  • Build date:     $kernel_date"
-ui_print " "
-ui_print "- Flashing kernel to boot partition..."
+ui_print "- Flashing new kernel..."
 
-flash_boot  # Skip ramdisk repack for GKI devices with init_boot ramdisk
+# Extract and display kernel info
+kernel_version=$(strings "$home"/Image 2>/dev/null | grep -m1 'Linux version' | awk '{print $3}')
+ui_print "  Installing: $kernel_version"
 
+flash_boot  # Flash new kernel
 ## End boot install
 
-# Step 5: Post-installation validation
+ui_print " "
+
+# Step 4: Post-install validation
 post_install_check
 
-# Step 6: Setup post-boot optimization
+# Step 5: Setup post-boot script
 set_postflash_configs
 
-## Final summary
-ui_print "================================================"
-ui_print "  ✓ INSTALLATION COMPLETE"
-ui_print "================================================"
 ui_print " "
-ui_print "Summary:"
-ui_print "  ✓ Old kernel configs completely removed"
-ui_print "  ✓ New kernel flashed successfully"
-ui_print "  ✓ ROM modules preserved and will be reused"
-ui_print "  ✓ Post-boot optimization configured"
-ui_print "  ✓ Backup saved to /sdcard/TemplarKernel_Backup"
+ui_print "================================================"
+ui_print " ✓ Installation Complete"
+ui_print "================================================"
+ui_print "  • Kernel flashed & configs cleaned"
+ui_print "  • Backup: /sdcard/TemplarKernel_Backup"
+ui_print "  • Post-boot script configured"
 ui_print " "
-ui_print "Next steps:"
-ui_print "  1. Reboot your device now"
+ui_print "Next Steps:"
+ui_print "  1. Reboot device now"
 ui_print "  2. Wait 1-2 minutes for initialization"
-ui_print "  3. Check /data/local/tmp/templar_init.log"
+ui_print "  3. Check: /data/local/tmp/templar_init.log"
 ui_print " "
-ui_print "In case of bootloop:"
+ui_print "If bootloop occurs:"
 ui_print "  • Boot to recovery"
-ui_print "  • Flash backup from /sdcard/TemplarKernel_Backup"
-ui_print " "
+ui_print "  • Flash: OLD_boot_XXXXXX.img from backup folder"
 ui_print "================================================"
 ui_print " "
 
