@@ -4,7 +4,7 @@
 
 ### AnyKernel setup
 # Global properties
-properties() { '
+properties() { cat <<'PROP'
 kernel.string=Templar Kernel by WiL (@Steambot12)
 do.devicecheck=0
 do.modules=0
@@ -16,7 +16,8 @@ device.name2=
 supported.versions=
 supported.patchlevels=
 supported.vendorpatchlevels=
-'; } # end properties
+PROP
+}
 
 ### Kernel identification
 KERNEL_NAME="Templar"
@@ -32,55 +33,112 @@ patch_vbmeta_flag=auto
 # Import functions/variables and setup patching
 . tools/ak3-core.sh
 
-## Deep cleanup (silent mode)
+# Set home directory (AnyKernel working directory)
+home=$(pwd)
+
+## Deep cleanup - removes ALL traces of previous kernel
 deep_kernel_cleanup() {
     ui_print "→ Cleaning old kernel configs..."
-    
+
     {
-        # Module deps & cache
-        [ -d /data/vendor/modules ] && rm -rf /data/vendor/modules/modules.* /data/vendor/modules/*.bin
-        
-        # Sysctl & scheduler configs
-        [ -d /data/vendor/sysctl ] && rm -rf /data/vendor/sysctl/*
-        [ -d /data/vendor/scheduler ] && rm -rf /data/vendor/scheduler/*
-        rm -f /data/local/kernel.sysctl /data/vendor/etc/sysctl.d/*.conf
-        
-        # Reset schedtune
-        [ -d /dev/stune ] && for d in /dev/stune/*/; do
-            echo 0 > "${d}schedtune.boost" 2>/dev/null
-            echo 0 > "${d}schedtune.prefer_idle" 2>/dev/null
-        done
-        
-        # I/O scheduler reset
-        [ -d /data/vendor/iosched ] && rm -rf /data/vendor/iosched/*
+        # 1. Module cleanup (vendor + vendor_dlkm + system)
+        if [ -d /data/vendor/modules ]; then
+            rm -rf /data/vendor/modules/*
+        fi
+
+        if [ -d /vendor_dlkm ]; then
+            find /vendor_dlkm -name "*.ko" -delete 2>/dev/null
+            rm -f /vendor_dlkm/lib/modules/*/modules.* 2>/dev/null
+        fi
+
+        # System modules (older devices)
+        [ -d /data/system/modules ] && rm -rf /data/system/modules/*
+
+        # 2. Sysctl & kernel parameters
+        rm -rf /data/vendor/sysctl/* 2>/dev/null
+        rm -f /data/local/kernel.sysctl 2>/dev/null
+        rm -f /data/vendor/etc/sysctl.d/*.conf 2>/dev/null
+
+        # 3. Scheduler configs (complete reset)
+        rm -rf /data/vendor/scheduler/* 2>/dev/null
+
+        # Reset schedtune/cgroup values
+        if [ -d /dev/stune ]; then
+            for d in /dev/stune/*/; do
+                [ -f "${d}schedtune.boost" ] && echo 0 > "${d}schedtune.boost" 2>/dev/null
+                [ -f "${d}schedtune.prefer_idle" ] && echo 0 > "${d}schedtune.prefer_idle" 2>/dev/null
+                [ -f "${d}schedtune.sched_boost" ] && echo 0 > "${d}schedtune.sched_boost" 2>/dev/null
+            done
+        fi
+
+        # Remove custom cgroup configs
+        rm -rf /data/vendor/cgroup/* 2>/dev/null
+
+        # 4. I/O scheduler reset (set to none, let kernel decide default)
+        rm -rf /data/vendor/iosched/* 2>/dev/null
         for q in /sys/block/*/queue/scheduler; do
-            [ -f "$q" ] && echo "none" > "$q" 2>/dev/null
+            if [ -f "$q" ]; then
+                echo "none" > "$q" 2>/dev/null || echo "noop" > "$q" 2>/dev/null
+            fi
         done
-        
-        # CPUFreq & thermal
-        [ -d /data/vendor/cpufreq ] && rm -rf /data/vendor/cpufreq/*
-        [ -d /data/system/cpufreq ] && rm -rf /data/system/cpufreq/*
-        [ -d /data/vendor/thermal ] && rm -rf /data/vendor/thermal/*
-        [ -d /data/vendor/thermal_config ] && rm -f /data/vendor/thermal_config/*.conf
-        
-        # Kernel cache & logs
-        [ -d /data/vendor/kernel ] && rm -rf /data/vendor/kernel/*
-        [ -d /data/kernel ] && rm -rf /data/kernel/*
+
+        # 5. CPUFreq & governor cleanup
+        rm -rf /data/vendor/cpufreq/* 2>/dev/null
+        rm -rf /data/system/cpufreq/* 2>/dev/null
+        rm -rf /data/vendor/perf/* 2>/dev/null
+
+        # Reset governor to default
+        for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+            [ -f "$gov" ] && echo "schedutil" > "$gov" 2>/dev/null
+        done
+
+        # 6. Thermal configs
+        rm -rf /data/vendor/thermal/* 2>/dev/null
+        rm -rf /data/vendor/thermal_config/* 2>/dev/null
+        rm -f /data/.tp/* 2>/dev/null
+
+        # 7. Kernel cache & state
+        rm -rf /data/vendor/kernel/* 2>/dev/null
+        rm -rf /data/kernel/* 2>/dev/null
+
+        # Clear kernel ring buffer
         dmesg -c > /dev/null 2>&1
-        
-        # BPF/eBPF cleanup
+
+        # 8. BPF/eBPF complete cleanup
         if [ -d /sys/fs/bpf ]; then
+            # Unpin all BPF programs and maps
+            find /sys/fs/bpf -type f -delete 2>/dev/null
+
+            # Remount clean BPF filesystem
             umount /sys/fs/bpf 2>/dev/null
             mount -t bpf bpf /sys/fs/bpf 2>/dev/null
         fi
-        [ -d /data/vendor/bpf ] && rm -f /data/vendor/bpf/*.o /data/vendor/bpf/*.prog
-        
-        # Network & temp files
-        [ -d /data/vendor/netd ] && rm -f /data/vendor/netd/.*.configured
-        rm -rf /data/local/tmp/kernel* /data/local/tmp/*.ko /data/local/tmp/kern_*.log
-        rm -f /cache/kernel* /data/cache/kernel /data/bootconfig
-        
+
+        [ -d /data/vendor/bpf ] && rm -rf /data/vendor/bpf/* 2>/dev/null
+
+        # 9. Device tree overlays cleanup
+        rm -f /data/vendor/dtbo/* 2>/dev/null
+        rm -f /data/vendor/dtb/* 2>/dev/null
+
+        # 10. Network configurations
+        rm -f /data/vendor/netd/.*.configured 2>/dev/null
+
+        # 11. Temporary files & logs
+        rm -rf /data/local/tmp/kernel* 2>/dev/null
+        rm -f /data/local/tmp/*.ko 2>/dev/null
+        rm -f /data/local/tmp/kern_*.log 2>/dev/null
+        rm -f /cache/kernel* 2>/dev/null
+        rm -f /data/cache/kernel 2>/dev/null
+        rm -f /data/bootconfig 2>/dev/null
+
+        # 12. Old Templar configs (if exists from previous install)
+        rm -f /data/adb/service.d/templar_kernel_init.sh 2>/dev/null
+        rm -f /data/local/tmp/templar_init.log 2>/dev/null
+
+        # 13. Sync to ensure all writes complete
         sync
+
+        ui_print "  ✓ Cache cleared"
     } 2>/dev/null
 }
 
@@ -88,105 +146,107 @@ deep_kernel_cleanup() {
 backup_boot_image() {
     backup_dir="/sdcard/${KERNEL_NAME}Kernel_Backup"
     timestamp=$(date +%Y%m%d_%H%M%S)
-    
+
     mkdir -p "$backup_dir" 2>/dev/null
-    
+
     # Save current kernel info
-    uname -a > "$backup_dir/${KERNEL_NAME}-PreviousKernel_${timestamp}.info" 2>/dev/null
-    
+    {
+        echo "Previous Kernel Info"
+        echo "===================="
+        uname -a
+        echo ""
+        cat /proc/version
+    } > "$backup_dir/${KERNEL_NAME}-PreviousKernel_${timestamp}.info" 2>/dev/null
+
     ui_print "→ Creating boot backup..."
-    
+
     boot_partition=""
     detection_method=""
-    
-    # Method 1: Use $bootimg from ak3-core.sh
+
+    # Method 1: Use $bootimg from ak3-core.sh (most reliable)
     if [ -n "$bootimg" ] && [ -b "$bootimg" ]; then
         boot_partition="$bootimg"
-        detection_method="ak3"
+        detection_method="ak3-core"
     fi
-    
-    # Method 2: Current slot (A/B devices)
+
+    # Method 2: A/B slot detection
     if [ -z "$boot_partition" ]; then
         current_slot=$(getprop ro.boot.slot_suffix 2>/dev/null)
         if [ -n "$current_slot" ]; then
-            for base in "/dev/block/bootdevice/by-name" "/dev/block/by-name" "/dev/block/platform/*/by-name" "/dev/block/platform/*/*/by-name"; do
-                for path in ${base}/boot${current_slot} ${base}/boot; do
-                    if [ -b "$path" ] 2>/dev/null; then
-                        boot_partition="$path"
-                        detection_method="slot$current_slot"
-                        break 2
-                    fi
-                done
-            done
-        fi
-    fi
-    
-    # Method 3: MediaTek paths
-    if [ -z "$boot_partition" ]; then
-        for path in \
-            "/dev/block/platform/bootdevice/by-name/boot" \
-            "/dev/block/platform/soc/*/by-name/boot" \
-            "/dev/block/platform/soc/*/*/by-name/boot" \
-            "/dev/block/by-name/boot_para" \
-            "/dev/block/mmcblk0boot0" \
-            "/dev/block/mmcblk0boot1"; do
-            
-            for expanded in $path; do
-                if [ -b "$expanded" ] 2>/dev/null; then
-                    boot_partition="$expanded"
-                    detection_method="mtk"
-                    break 2
+            for base in /dev/block/bootdevice/by-name /dev/block/by-name; do
+                path="${base}/boot${current_slot}"
+                if [ -b "$path" ]; then
+                    boot_partition="$path"
+                    detection_method="slot-$current_slot"
+                    break
                 fi
             done
+        fi
+    fi
+
+    # Method 3: Direct by-name lookup (non-A/B)
+    if [ -z "$boot_partition" ]; then
+        for path in \
+            /dev/block/bootdevice/by-name/boot \
+            /dev/block/by-name/boot \
+            /dev/block/platform/*/by-name/boot \
+            /dev/block/platform/*/*/by-name/boot; do
+
+            if [ -b "$path" ] 2>/dev/null; then
+                boot_partition="$path"
+                detection_method="by-name"
+                break
+            fi
         done
     fi
-    
-    # Method 4: Aggressive search
+
+    # Method 4: MTK-specific paths
     if [ -z "$boot_partition" ]; then
-        boot_partition=$(find /dev/block -type b -name "boot*" 2>/dev/null | grep -E "boot$|boot_[ab]$|boot_para$|mmcblk.*boot" | head -1)
-        if [ -n "$boot_partition" ] && [ -b "$boot_partition" ]; then
-            detection_method="search"
-        else
-            boot_partition=""
-        fi
-    fi
-    
-    # Method 5: Proc filesystem
-    if [ -z "$boot_partition" ]; then
-        boot_partition=$(grep -m1 " boot " /proc/mounts 2>/dev/null | awk '{print $1}')
-        if [ -n "$boot_partition" ] && [ -b "$boot_partition" ]; then
-            detection_method="proc"
-        else
-            boot_line=$(grep -iE "boot|mmcblk.*boot" /proc/partitions 2>/dev/null | tail -1 | awk '{print $4}')
-            if [ -n "$boot_line" ]; then
-                boot_partition="/dev/block/$boot_line"
-                [ -b "$boot_partition" ] && detection_method="partition" || boot_partition=""
+        for path in \
+            /dev/block/by-name/boot_para \
+            /dev/block/mmcblk0boot0; do
+
+            if [ -b "$path" ]; then
+                boot_partition="$path"
+                detection_method="mtk"
+                break
             fi
-        fi
+        done
     fi
-    
+
     # Execute backup
     if [ -n "$boot_partition" ] && [ -b "$boot_partition" ]; then
         backup_file="$backup_dir/${KERNEL_NAME}-Backup_${timestamp}.img"
-        
-        dd if="$boot_partition" of="$backup_file" bs=4096 2>&1 | grep -v "records" | grep -v "bytes"
-        
+
+        dd if="$boot_partition" of="$backup_file" bs=1M 2>/dev/null
+
         if [ -f "$backup_file" ]; then
-            backup_size=$(stat -c%s "$backup_file" 2>/dev/null || stat -f%z "$backup_file" 2>/dev/null || echo 0)
+            backup_size=$(stat -c%s "$backup_file" 2>/dev/null || echo 0)
             backup_mb=$((backup_size / 1048576))
-            
+
+            # Validate boot image (check ANDROID! magic header)
             if [ "$backup_size" -gt 1048576 ]; then
-                ui_print "  ✓ Backup: ${backup_mb}MB ($detection_method)"
-                
-                # Save metadata
-                {
-                    echo "Boot partition: $boot_partition"
-                    echo "Detection method: $detection_method"
-                    echo "Backup file: ${KERNEL_NAME}-Backup_${timestamp}.img"
-                    echo "Backup size: ${backup_mb}MB"
-                } >> "$backup_dir/${KERNEL_NAME}-PreviousKernel_${timestamp}.info"
+                magic=$(dd if="$backup_file" bs=8 count=1 2>/dev/null)
+                if [ "$magic" = "ANDROID!" ] || [ "$backup_size" -gt 10485760 ]; then
+                    ui_print "  ✓ Backup: ${backup_mb}MB ($detection_method)"
+
+                    # Save metadata
+                    {
+                        echo ""
+                        echo "Backup Info"
+                        echo "==========="
+                        echo "Boot partition: $boot_partition"
+                        echo "Detection method: $detection_method"
+                        echo "Backup file: ${KERNEL_NAME}-Backup_${timestamp}.img"
+                        echo "Backup size: ${backup_mb}MB"
+                        echo "Timestamp: $(date)"
+                    } >> "$backup_dir/${KERNEL_NAME}-PreviousKernel_${timestamp}.info"
+                else
+                    ui_print "  ✗ Backup invalid (bad magic)"
+                    rm -f "$backup_file"
+                fi
             else
-                ui_print "  ✗ Backup failed (size: ${backup_mb}MB)"
+                ui_print "  ✗ Backup too small (${backup_mb}MB)"
                 rm -f "$backup_file"
             fi
         else
@@ -200,72 +260,171 @@ backup_boot_image() {
 
 ## Version check
 check_kernel_version() {
-    current_kernel=$(uname -r 2>/dev/null | cut -d'.' -f1-2)
-    [ -z "$current_kernel" ] && current_kernel=$(cat /proc/version 2>/dev/null | awk '{print $3}' | cut -d'.' -f1-2)
-    
-    new_kernel_string=$(strings "$home"/Image 2>/dev/null | grep -m1 'Linux version' | awk '{print $3}' | cut -d'.' -f1-2)
-    [ -z "$new_kernel_string" ] && new_kernel_string=$(strings "$home"/Image 2>/dev/null | grep -m1 '5\\.10\\.' | cut -d'.' -f1-2)
-    [ -z "$new_kernel_string" ] && new_kernel_string="5.10"
-    
+    current_kernel=$(uname -r 2>/dev/null | cut -d'-' -f1 | cut -d'.' -f1-2)
+    [ -z "$current_kernel" ] && current_kernel="unknown"
+
+    ui_print "→ Checking kernel image..."
+
+    # Check if kernel image exists in AnyKernel directory
+    kernel_img=""
+    for img in "$home"/Image "$home"/Image.gz "$home"/Image.lz4 "$home"/Image-dtb "$home"/Image.gz-dtb; do
+        if [ -f "$img" ]; then
+            kernel_img="$img"
+            ui_print "  ✓ Found: $(basename $img)"
+            break
+        fi
+    done
+
+    if [ -z "$kernel_img" ]; then
+        ui_print "  ✗ ERROR: Kernel image not found in zip"
+        ui_print "  Expected: Image or Image.gz or Image.lz4"
+        ui_print "  Files in directory:"
+        ls -la "$home"/ 2>/dev/null | grep -i image || ls -la "$home"/
+        exit 1
+    fi
+
+    # Get file size
+    kernel_size=$(stat -c%s "$kernel_img" 2>/dev/null || echo 0)
+    kernel_mb=$((kernel_size / 1048576))
+    ui_print "  Size: ${kernel_mb}MB"
+
+    if [ "$kernel_size" -lt 5242880 ]; then
+        ui_print "  ✗ ERROR: Kernel image too small (< 5MB)"
+        exit 1
+    fi
+
+    # Try to detect kernel version from image
+    version_line=$(strings "$kernel_img" 2>/dev/null | grep -E "^Linux version [0-9]" | head -1)
+
+    if [ -n "$version_line" ]; then
+        # Extract version: "Linux version 5.10.260-Templar..." -> "5.10.260"
+        full_version=$(echo "$version_line" | awk '{print $3}' | cut -d'-' -f1)
+        new_kernel_string=$(echo "$full_version" | cut -d'.' -f1-2)
+
+        ui_print "  Kernel: $full_version"
+    else
+        # Fallback: assume 5.10 if string not found
+        ui_print "  ! Version string not found, assuming 5.10"
+        new_kernel_string="5.10"
+    fi
+
     new_major=$(echo "$new_kernel_string" | cut -d'.' -f1)
     new_minor=$(echo "$new_kernel_string" | cut -d'.' -f2)
-    
-    ui_print "→ Version: $current_kernel → $new_kernel_string"
-    
-    if [ "$new_major" != "5" ] || [ "$new_minor" != "10" ]; then
+
+    ui_print "→ Version check: $current_kernel → $new_kernel_string"
+
+    # Validate GKI 5.10
+    if [ "$new_major" = "5" ] && [ "$new_minor" = "10" ]; then
+        ui_print "  ✓ GKI 5.10 kernel detected"
+    else
         ui_print "  ✗ ERROR: Requires GKI 5.10 kernel"
+        ui_print "  Detected: $new_major.$new_minor"
+        ui_print "  This kernel is for Android 11+ GKI 5.10 only"
         exit 1
     fi
 }
 
 ## Post-install validation
 post_install_check() {
-    if [ -f "$home/Image" ]; then
-        kernel_size=$(stat -c%s "$home/Image" 2>/dev/null || echo 0)
-        kernel_mb=$((kernel_size / 1048576))
-        
-        if [ "$kernel_size" -gt 10485760 ]; then
-            ui_print "  ✓ Kernel flashed: ${kernel_mb}MB"
-        else
-            ui_print "  ! Warning: Kernel size abnormal"
+    ui_print "→ Validating installation..."
+
+    # Check if any kernel image exists in AnyKernel directory
+    kernel_found=0
+    for img in "$home"/Image "$home"/Image.gz "$home"/Image.lz4 "$home"/Image-dtb "$home"/Image.gz-dtb; do
+        if [ -f "$img" ]; then
+            kernel_size=$(stat -c%s "$img" 2>/dev/null || echo 0)
+            kernel_mb=$((kernel_size / 1048576))
+
+            if [ "$kernel_size" -gt 5242880 ]; then
+                ui_print "  ✓ Kernel: $(basename $img) (${kernel_mb}MB)"
+                kernel_found=1
+                break
+            fi
         fi
+    done
+
+    if [ "$kernel_found" -eq 0 ]; then
+        ui_print "  ✗ ERROR: No valid kernel image found"
+        ui_print "  Installation may have failed"
+        ui_print "  Files in zip:"
+        ls -lh "$home"/ | grep -E "Image|\.ko$" || ls -lh "$home"/
+        exit 1
     fi
 }
 
 ## Post-boot script setup
 set_postflash_configs() {
     mkdir -p /data/adb/service.d 2>/dev/null
-    
+
     cat > /data/adb/service.d/templar_kernel_init.sh << 'EOF'
 #!/system/bin/sh
 LOGFILE="/data/local/tmp/templar_init.log"
+
+# Wait for boot complete
+while [ "$(getprop sys.boot_completed)" != "1" ]; do
+    sleep 2
+done
+
+# Additional stabilization delay
+sleep 15
+
 {
-    echo "Templar Kernel Post-Boot Init | $(date)"
-    sleep 30
-    
+    echo "========================================"
+    echo "Templar Kernel Post-Boot Init"
+    echo "$(date)"
+    echo "========================================"
+    echo ""
+
     echo "System Info:"
     echo "  Kernel: $(uname -r)"
     echo "  Android: $(getprop ro.build.version.release)"
-    
+    echo "  Security patch: $(getprop ro.build.version.security_patch)"
     echo ""
+
+    echo "CPU Info:"
+    cat /proc/cpuinfo | grep -E "Hardware|processor" | head -5
+    echo ""
+
     echo "I/O Schedulers:"
     for q in /sys/block/*/queue/scheduler; do
         [ -f "$q" ] && echo "  $(basename $(dirname $(dirname $q))): $(cat $q | grep -o '\[.*\]' | tr -d '[]')"
     done
-    
     echo ""
+
+    echo "CPU Governors:"
+    for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        if [ -f "$cpu" ]; then
+            cpu_num=$(echo "$cpu" | grep -o 'cpu[0-9]*' | head -1)
+            echo "  $cpu_num: $(cat $cpu)"
+        fi
+    done | head -4
+    echo ""
+
+    echo "Memory Info:"
+    free -h | grep -E "Mem:|Swap:"
+    echo ""
+
     echo "Clearing cache..."
-    sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
-    
+    sync
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+    echo "  ✓ Cache cleared"
     echo ""
+
+    echo "========================================"
     echo "✓ Post-boot init complete"
-    
-    # Self-destruct
+    echo "========================================"
+
+    # Self-destruct after successful run
+    sleep 5
     rm -f /data/adb/service.d/templar_kernel_init.sh
 } > "$LOGFILE" 2>&1
+
+# Set readable permissions
+chmod 644 "$LOGFILE" 2>/dev/null
 EOF
-    
+
     chmod 755 /data/adb/service.d/templar_kernel_init.sh 2>/dev/null
+    ui_print "  ✓ Post-boot script created"
 }
 
 ## ==============================================
@@ -312,11 +471,14 @@ ui_print "============================================"
 ui_print " "
 ui_print "  Backup: /sdcard/${KERNEL_NAME}Kernel_Backup"
 ui_print " "
-ui_print "  Next: Reboot and wait ~2 minutes"
-ui_print "  Log: /data/local/tmp/templar_init.log"
+ui_print "  NEXT STEPS:"
+ui_print "  1. Reboot device"
+ui_print "  2. Wait 2-3 minutes for init"
+ui_print "  3. Check: /data/local/tmp/templar_init.log"
 ui_print " "
-ui_print "  If bootloop:"
-ui_print "  → Flash ${KERNEL_NAME}-Backup_*.img"
+ui_print "  If bootloop occurs:"
+ui_print "  → Flash: ${KERNEL_NAME}-Backup_*.img"
+ui_print "     from /sdcard/${KERNEL_NAME}Kernel_Backup"
 ui_print " "
 ui_print "============================================"
 ui_print " "
