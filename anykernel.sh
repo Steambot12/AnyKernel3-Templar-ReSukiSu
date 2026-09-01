@@ -368,11 +368,8 @@ sleep 15
     free -h | grep -E "Mem:|Swap:"
     echo ""
 
-    echo "Clearing cache..."
-    sync
-    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
-    echo "  ✓ Cache cleared"
-    echo ""
+    # No drop_caches here: it throws away the page cache the boot just
+    # populated, so every app re-reads from flash -- slower AND more power.
 
     echo "========================================"
     echo "✓ Post-boot init complete"
@@ -394,8 +391,12 @@ EOF
     cat > /data/adb/service.d/templar_power_daily.sh << 'PWREOF'
 #!/system/bin/sh
 # Templar Kernel — Daily Power Efficiency Tuning
-# Runs every boot. Do NOT delete — these settings are not persistent
-# across reboots without this script.
+# Runs every boot (Magisk/KernelSU service.d). Do NOT delete — these are
+# runtime settings, not persistent across reboots.
+#
+# Goal: cut idle/suspend drain by removing needless wakeups. It deliberately
+# does NOT cap CPU frequency: capping makes each task take longer, RAISING
+# busy% and hurting responsiveness — the wrong lever for battery.
 
 # Wait for boot complete
 while [ "$(getprop sys.boot_completed)" != "1" ]; do
@@ -403,30 +404,107 @@ while [ "$(getprop sys.boot_completed)" != "1" ]; do
 done
 sleep 5
 
+# write-if-exists: skip missing nodes silently (portable across SoCs)
+w() { [ -f "$1" ] && echo "$2" > "$1" 2>/dev/null; }
+
 {
     echo "Templar power tuning applied: $(date)"
 
-    # Skip redundant sync on suspend (Android already syncs)
-    [ -f /sys/power/sync_on_suspend ] && echo 0 > /sys/power/sync_on_suspend
+    # --- VM: fewer background wakeups (existing, kept) ---
+    w /sys/power/sync_on_suspend 0             # Android already syncs on suspend
+    w /proc/sys/vm/compaction_proactiveness 0  # no periodic kcompactd wakeups
+    w /proc/sys/vm/page_cluster 0              # zram: no readahead benefit
+    w /proc/sys/vm/watermark_boost_factor 0    # LMKD handles memory pressure
 
-    # Disable proactive compaction (no THP pressure on mobile)
-    echo 0 > /proc/sys/vm/compaction_proactiveness 2>/dev/null
+    # --- VM: stretch periodic timers so the SoC stays in deep idle longer ---
+    w /proc/sys/vm/stat_interval 10            # vmstat updater 1s -> 10s
+    w /proc/sys/vm/dirty_writeback_centisecs 1500  # bg flusher 5s -> 15s
 
-    # Disable ZRAM readahead (no seek latency = no readahead benefit)
-    echo 0 > /proc/sys/vm/page_cluster 2>/dev/null
+    # --- cpuidle: force TEO (safety net) ---
+    # menu + teo both build in; menu outranks teo (rating 20>19) and wins if
+    # the cmdline governor pick is ever lost -> shallow C-states -> idle drain.
+    w /sys/devices/system/cpu/cpuidle/current_governor teo
 
-    # Disable watermark boost (LMKD handles memory pressure)
-    echo 0 > /proc/sys/vm/watermark_boost_factor 2>/dev/null
+    # --- cpuidle: clear USER-disabled idle states ---
+    # A vendor tool or a previous kernel can leave deep states disabled, so a
+    # cluster never powers off and its CPUs look "awake every few seconds".
+    # Writing 0 clears only DISABLED_BY_USER; a driver-disabled state stays off.
+    for s in /sys/devices/system/cpu/cpu*/cpuidle/state*/disable; do
+        [ -f "$s" ] && echo 0 > "$s" 2>/dev/null
+    done
 
-    # Reduce vblank IRQ off-delay from 5s to 1s. At 120Hz the default
-    # fires 600 unnecessary interrupts per idle transition; 1s still
-    # covers fast consumer reconnects.
+    # --- Pin unbound/power-efficient workqueues to the little cluster ---
+    # With workqueue.power_efficient=1 every WQ_POWER_EFFICIENT queue becomes
+    # unbound and its worker can be placed on ANY cpu, so housekeeping work
+    # wakes the big cores. Background work does not need them. Derived from
+    # cpu_capacity so it is portable; skipped entirely if that is unavailable.
+    WQ_CPUMASK=/sys/devices/virtual/workqueue/cpumask
+    if [ -f "$WQ_CPUMASK" ]; then
+        maxcap=0
+        for c in /sys/devices/system/cpu/cpu*/cpu_capacity; do
+            [ -f "$c" ] || continue
+            v=$(cat "$c" 2>/dev/null) || continue
+            [ "$v" -gt "$maxcap" ] 2>/dev/null && maxcap=$v
+        done
+
+        if [ "$maxcap" -gt 0 ]; then
+            mask=0
+            for c in /sys/devices/system/cpu/cpu*/cpu_capacity; do
+                [ -f "$c" ] || continue
+                v=$(cat "$c" 2>/dev/null) || continue
+                # <=60% of the biggest cpu == little tier on 2- and 3-tier SoCs
+                [ $((v * 100 / maxcap)) -le 60 ] || continue
+                n=$(basename "$(dirname "$c")" | tr -dc 0-9)
+                mask=$((mask | (1 << n)))
+            done
+            # Never write an empty mask (uniform-capacity SoC, or parse failure).
+            [ "$mask" -gt 0 ] && printf '%x\n' "$mask" > "$WQ_CPUMASK" 2>/dev/null
+        fi
+    fi
+
+    # --- khugepaged: 10s -> 30s scan interval ---
+    # THP is madvise-only, so khugepaged still runs but has far less to do;
+    # its scan is the wakeup, not the collapse work.
+    w /sys/kernel/mm/transparent_hugepage/khugepaged/scan_sleep_millisecs 30000
+
+    # --- Reduce vblank IRQ off-delay 5s -> 1s ---
+    # At 120Hz the default fires ~600 needless IRQs per idle transition; 1s
+    # still covers fast consumer reconnects.
     for p in /sys/module/drm/parameters/vblankoffdelay \
              /sys/module/msm_drm/parameters/vblankoffdelay; do
         [ -f "$p" ] && echo 1000 > "$p" 2>/dev/null && break
     done
 
+    # --- Boeffla wakelock blocker: kill VENDOR suspend-abort wakeups ---
+    # This is THE lever for reaching deep sleep / ~10mA idle: if suspend keeps
+    # aborting, a vendor wakeup source is holding the AP awake. The in-kernel
+    # curated default list is already active; add DEVICE-SPECIFIC names below.
+    # The report at the end of this log names the real culprits on THIS device.
+    # LEAVE EMPTY until you have real names: a wrong name does nothing, and
+    # blocking an alarm/timer/input source breaks notifications & alarms.
+    EXTRA_WL=""
+    BLK=/sys/class/misc/boeffla_wakelock_blocker/wakelock_blocker
+    [ -n "$EXTRA_WL" ] && w "$BLK" "$EXTRA_WL"
+
     echo "Done"
+
+    # --- Wakeup-source report (diagnostic only, no tuning) ---
+    # Idle/deepsleep drain and "big cores wake every few seconds" are almost
+    # always a vendor wakeup source, which no kernel config can name in
+    # advance. Sample once the device has settled and log the top holders so
+    # EXTRA_WL above can be filled in with real names.
+    (
+        sleep 300
+        WS=/sys/kernel/debug/wakeup_sources
+        [ -f "$WS" ] || exit 0
+        echo ""
+        echo "--- top wakeup sources @ $(date) ---"
+        echo "name / active_count / total_time_ms / prevent_suspend_ms"
+        # Columns: 1 name .. 2 active_count .. 7 total_time .. 10 prevent_suspend_time.
+        # Sorted by prevent_suspend_time: that is the one that blocks deep sleep.
+        awk 'NR>1 && ($10+0 > 0 || $7+0 > 0) { printf "%-32s %8s %12s %12s\n", $1, $2, $7, $10 }' "$WS" \
+            | sort -k4 -rn | head -15
+    ) >> /data/local/tmp/templar_power.log 2>&1 &
 } >> /data/local/tmp/templar_power.log 2>&1
 PWREOF
 
